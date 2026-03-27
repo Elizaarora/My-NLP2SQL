@@ -1,8 +1,7 @@
 .env
-__pycache__
-prompts/__pycache__/
-mydatabase.db
-temp_database.db
-sample_data.db
+__pycache__/
+*.pyc
+venv/
+.cursor/
+*.db
 .DS_Store
-sample.db

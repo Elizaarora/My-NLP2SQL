@@ -5,13 +5,12 @@ import io
 import json
 import re
 import logging
-from typing import Dict, List, Optional, Union, TypedDict
+from typing import Dict, List, Optional, TypedDict
 import pandas as pd
 import plotly.express as px
 import plotly.figure_factory as ff
 import plotly.graph_objects as go
 from scipy import stats
-import statsmodels.api as sm
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from statsmodels.tsa.seasonal import seasonal_decompose
 import streamlit as st
@@ -23,11 +22,7 @@ from streamlit_extras.dataframe_explorer import dataframe_explorer
 import src.database.DB_Config as DB_Config
 from src.prompts.Base_Prompt import SYSTEM_MESSAGE
 from src.api.LLM_Config import get_completion_from_messages
-import hashlib
-from datetime import datetime
 from time import time
-from collections import defaultdict
-from jsonschema import validate as json_validate, ValidationError
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -52,7 +47,7 @@ st.set_page_config(
 
 def apply_custom_theme():
     custom_css = f"""
-    <style>
+    <style> 
     /* Global Styles */
     body, .stApp {{
         background-color: #1e1e1e;
@@ -140,17 +135,32 @@ def validate_sql_query(query: str) -> bool:
 # --- New helper: Validate that query uses existent tables/columns ---
 def validate_query_tables(query: str, schemas: dict) -> bool:
     """
-    Very basic check: warn if any known schema table name is missing in the query.
-    This is a heuristic check.
+    Check if the query uses tables that exist in the schema.
+    This is a heuristic check - warns if query might reference non-existent tables.
     """
+    if not schemas:
+        return True
+    
     lower_query = query.lower()
-    missing = []
-    for table in schemas.keys():
-        if table.lower() not in lower_query:
-            missing.append(table)
-    if missing:
-        logging.warning(f"LLM query does not mention these tables from the schema: {', '.join(missing)}")
+    schema_tables = {table.lower() for table in schemas.keys()}
+    
+    # Extract potential table names from query (basic heuristic)
+    # Look for FROM/JOIN keywords followed by table names
+    table_pattern = r'\b(?:from|join)\s+([a-z_][a-z0-9_]*)'
+    found_tables = set(re.findall(table_pattern, lower_query))
+    
+    # Check if any found tables are not in schema
+    unknown_tables = found_tables - schema_tables
+    if unknown_tables:
+        logger.warning(f"Query may reference tables not in schema: {', '.join(unknown_tables)}")
+        # Don't fail validation, just warn - might be aliases or valid table names
+    
+    # Check if at least one schema table is used
+    used_tables = found_tables & schema_tables
+    if not used_tables and found_tables:
+        logger.warning("Query does not appear to use any tables from the provided schema")
         return False
+    
     return True
 
 def get_data(query: str, db_name: str, db_type: str, host: Optional[str] = None, user: Optional[str] = None, password: Optional[str] = None) -> pd.DataFrame:
@@ -298,27 +308,41 @@ def generate_sql_query(user_message: str, schemas: dict, max_attempts: int = 1) 
     """
 
     for attempt in range(max_attempts):
+        response = None
         try:
             response = get_completion_from_messages(formatted_system_message, user_message)
-            # Strip any triple-backtick fences
-            response = re.sub(r'^```json\s*', '', response.strip())
-            response = re.sub(r'```$', '', response.strip())
-            json_response = json.loads(response)
-            try:
-                json_validate(instance=json_response, schema=DECISION_LOG_SCHEMA)
-            except ValidationError as ve:
-                logger.warning(f"JSON schema validation error: {ve.message}. Attempt: {attempt + 1}")
+
+            # Strip any triple-backtick fences (defensive; LLM_Config already cleans)
+            response_clean = re.sub(r'^```json\s*', '', response.strip())
+            response_clean = re.sub(r'```$', '', response_clean.strip())
+
+            # Best-effort JSON parsing
+            json_response = json.loads(response_clean)
+
+            # Best-effort extraction of query and decision log
+            decision_log = json_response.get('decision_log') or {}
+            if not isinstance(decision_log, dict):
+                decision_log = {}
+
+            best_query = json_response.get('query') or decision_log.get('generated_sql_query')
+
+            # Validate SQL safety, but do NOT fail just because of schema shape
+            if not best_query or not validate_sql_query(best_query):
+                logger.warning("LLM response did not contain a valid SELECT/WITH SQL query.")
                 continue
 
-            # Validate referenced tables in the generated SQL query
-            if not validate_query_tables(json_response.get('query', ''), schemas):
-                logger.warning("Generated SQL query contains non-existent tables/columns.")
+            # Optional: heuristic table validation (warning only)
+            try:
+                if not validate_query_tables(best_query, schemas):
+                    logger.warning("Generated SQL query may reference tables not in schema.")
+            except Exception as vt_ex:
+                logger.warning(f"validate_query_tables raised an exception: {vt_ex}")
 
             return {
-                "query": json_response.get('query'),
+                "query": best_query,
                 "error": json_response.get('error'),
-                "decision_log": json_response['decision_log'],
-                "visualization_recommendation": json_response['decision_log'].get('visualization_suggestion')
+                "decision_log": decision_log,
+                "visualization_recommendation": decision_log.get('visualization_suggestion')
             }
 
         except json.JSONDecodeError as e:
@@ -869,16 +893,17 @@ def assess_data_quality(df: pd.DataFrame) -> None:
             else:
                 st.success("No significant anomalies detected!")
 
-def handle_query_response(response: dict, db_name: str, db_type: str, host: Optional[str] = None, user: Optional[str] = None, password: Optional[str] = None) -> None:
+def handle_query_response(response: dict, db_name: str, db_type: str, host: Optional[str] = None, user: Optional[str] = None, password: Optional[str] = None, schemas: Optional[dict] = None, selected_tables: Optional[list] = None) -> None:
     """Process LLM-generated SQL query, display results, and handle visualizations."""
     try:
         query = response.get('query', '')
-        error = response.get('error', '')
+        error = response.get('error', None)
         decision_log = response.get('decision_log', {})
         visualization_recommendation = response.get('visualization_recommendation', None)
 
-        if error:
-            detailed_error = generate_detailed_error_message(error)
+        # Check for error (handle both None and empty string cases)
+        if error is not None and error:
+            detailed_error = generate_detailed_error_message(str(error))
             st.error(f"Error generating SQL query: {detailed_error}")
             return
 
@@ -1037,9 +1062,24 @@ def handle_query_response(response: dict, db_name: str, db_type: str, host: Opti
         if "query_history" not in st.session_state:
             st.session_state.query_history = []
             st.session_state.query_timestamps = []
+            st.session_state.query_db_info = []  # Store db info for each query
 
         st.session_state.query_history.append(query)
         st.session_state.query_timestamps.append(pd.Timestamp.now())
+        # Store database info for re-running queries (use function parameters)
+        if "query_db_info" not in st.session_state:
+            st.session_state.query_db_info = []
+        
+        db_info_dict = {
+            "db_name": db_name,
+            "db_type": db_type.lower() if isinstance(db_type, str) else str(db_type).lower(),
+            "host": host,
+            "user": user,
+            "password": password,
+            "schemas": schemas if schemas is not None else {},
+            "selected_tables": selected_tables if selected_tables is not None else []
+        }
+        st.session_state.query_db_info.append(db_info_dict)
 
     except Exception as e:
         detailed_error = generate_detailed_error_message(str(e))
@@ -1108,9 +1148,14 @@ def analyze_dataframe_for_visualization(df: pd.DataFrame) -> list:
 
 def generate_detailed_error_message(error_message: str) -> str:
     """Use the LLM to produce a user-friendly explanation of any encountered error."""
+    error_system_message = "You are a helpful assistant that explains technical errors in simple, user-friendly language. Provide clear, concise explanations without technical jargon when possible."
     prompt = f"Provide a detailed and user-friendly explanation for the following error message:\n\n{error_message}"
-    detailed_error = get_completion_from_messages(SYSTEM_MESSAGE, prompt)
-    return detailed_error.strip() if detailed_error else error_message
+    try:
+        detailed_error = get_completion_from_messages(error_system_message, prompt)
+        return detailed_error.strip() if detailed_error else error_message
+    except Exception as e:
+        logger.exception(f"Error generating detailed error message: {e}")
+        return error_message
 
 def display_decision_log_widgets(decision_log: Dict) -> None:
     """
@@ -1338,7 +1383,7 @@ if db_type == "SQLite":
                 logger.debug(f"Schemas being passed to `generate_sql_query`: {selected_schemas}")
                 with st.spinner('🧠 Generating SQL query...'):
                     response = generate_sql_query(user_message, selected_schemas)
-                handle_query_response(response, db_file, db_type='sqlite')
+                handle_query_response(response, db_file, db_type='sqlite', schemas=selected_schemas, selected_tables=selected_tables)
 
         else:
             st.info("📭 No tables found in the database.")
@@ -1376,7 +1421,7 @@ elif db_type == "PostgreSQL":
                     selected_schemas = {table: schemas[table] for table in selected_tables}
                     logger.debug(f"Schemas being passed to `generate_sql_query`: {selected_schemas}")
                     response = generate_sql_query(user_message, selected_schemas)
-                handle_query_response(response, postgres_db, db_type='postgresql', host=postgres_host, user=postgres_user, password=postgres_password)
+                handle_query_response(response, postgres_db, db_type='postgresql', host=postgres_host, user=postgres_user, password=postgres_password, schemas=selected_schemas, selected_tables=selected_tables)
         else:
             st.info("📭 No tables found in the database.")
     else:
@@ -1405,24 +1450,62 @@ with st.sidebar.expander(" Query History", expanded=False):
         end_index = start_index + queries_per_page
         page_queries = query_history_df.iloc[start_index:end_index]
 
-        for i, row in page_queries.iterrows():
-            with st.expander(f"🗂️ Query {i + 1}: {row['Timestamp'].strftime('%Y-%m-%d %H:%M:%S')}"):
+        for idx, (i, row) in enumerate(page_queries.iterrows()):
+            query_num = start_index + idx + 1
+            with st.expander(f"🗂️ Query {query_num}: {row['Timestamp'].strftime('%Y-%m-%d %H:%M:%S')}"):
                 st.write("**SQL Query:**")
                 st.code(row['Query'], language="sql")
 
-                if st.button(f"🔄 Re-run Query {i + 1}", key=f"rerun_query_{i}"):
-                    user_message = row['Query']
-                    with st.spinner('🔄 Re-running the saved SQL query...'):
-                        selected_schemas = {table: schemas[table] for table in selected_tables}
-                        response = generate_sql_query(user_message, selected_schemas)
-                        handle_query_response(
-                            response,
-                            db_file if db_type == "SQLite" else postgres_db,
-                            db_type,
-                            host=postgres_host if db_type == "PostgreSQL" else None,
-                            user=postgres_user if db_type == "PostgreSQL" else None,
-                            password=postgres_password if db_type == "PostgreSQL" else None
-                        )
+                if st.button(f"🔄 Re-run Query {query_num}", key=f"rerun_query_{start_index + idx}"):
+                    query_idx = start_index + idx
+                    db_info_list = st.session_state.get("query_db_info", [])
+                    if query_idx < len(db_info_list):
+                        db_info = db_info_list[query_idx]
+                        user_message = row['Query']
+                        with st.spinner('🔄 Re-running the saved SQL query...'):
+                            # Use stored schemas and tables if available
+                            if db_info.get("selected_tables") and db_info.get("schemas"):
+                                selected_schemas = {table: db_info["schemas"][table] 
+                                                  for table in db_info["selected_tables"] 
+                                                  if table in db_info["schemas"]}
+                            else:
+                                # Fallback: try to get current schemas
+                                try:
+                                    db_info_type = db_info.get("db_type", "").lower()
+                                    if db_info_type == "sqlite":
+                                        current_schemas = DB_Config.get_all_schemas(db_info.get("db_name", ""), 'sqlite')
+                                    elif db_info_type == "postgresql":
+                                        current_schemas = DB_Config.get_all_schemas(
+                                            db_info.get("db_name", ""), 
+                                            'postgresql',
+                                            db_info.get("host"),
+                                            db_info.get("user"),
+                                            db_info.get("password")
+                                        )
+                                    else:
+                                        current_schemas = {}
+                                    selected_schemas = current_schemas
+                                except Exception as e:
+                                    logger.error(f"Could not retrieve schemas for re-run: {e}")
+                                    st.error("Could not retrieve database schemas. Please reconnect to the database.")
+                                    selected_schemas = {}
+                            
+                            if selected_schemas:
+                                response = generate_sql_query(user_message, selected_schemas)
+                                handle_query_response(
+                                    response,
+                                    db_info.get("db_name", ""),
+                                    db_info.get("db_type", "sqlite"),
+                                    host=db_info.get("host"),
+                                    user=db_info.get("user"),
+                                    password=db_info.get("password"),
+                                    schemas=selected_schemas,
+                                    selected_tables=db_info.get("selected_tables", [])
+                                )
+                            else:
+                                st.error("Cannot re-run query: No schema information available.")
+                    else:
+                        st.warning("Query information not available for re-run. This query was created before database info tracking was added.")
 
         st.write(f"Page {current_page} of {num_pages}")
 

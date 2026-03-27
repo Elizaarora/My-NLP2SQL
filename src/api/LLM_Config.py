@@ -58,8 +58,9 @@ def get_completion_from_gemini(
         logger.info("=== INPUT ===")
         logger.info(f"Combined Message:\n{combined_message}")
         logger.info(f"Temperature: {temperature}")
-        
-        model_instance = genai.GenerativeModel('gemini-2.0-flash')
+
+        # Use the free-tier text model
+        model_instance = genai.GenerativeModel("gemini-2.5-flash")
         response = model_instance.generate_content(
             contents=combined_message,
             generation_config={"temperature": temperature}
